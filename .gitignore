@@ -1,0 +1,7 @@
+tgt_snf_account.toml
+*.p8
+*.pem
+rsa_key.*
+__pycache__/
+*.pyc
+.env
