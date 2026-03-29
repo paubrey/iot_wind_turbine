@@ -126,15 +126,21 @@ def mapNUM(value, fromLow, fromHigh, toLow, toHigh):  # Arduino-style range mapp
     return (toHigh - toLow) * (value - fromLow) / (fromHigh - fromLow) + toLow
 
 
-def get_motor_state(adc_value):  # Translate ADC midpoint (128) into direction + duty cycle
-    value = adc_value - 128
+ADC_MIDPOINT = 128
+ADC_MAX = 255
+ADC_MIN = 0
+
+def get_motor_state(adc_value):  # Translate ADC midpoint into direction + duty cycle scaled to actual pot range
+    value = adc_value - ADC_MIDPOINT
     if value > 0:
         direction = "forward"
+        duty_cycle = min(abs(value) / (ADC_MAX - ADC_MIDPOINT) * 100, 100)
     elif value < 0:
         direction = "backward"
+        duty_cycle = min(abs(value) / (ADC_MIDPOINT - ADC_MIN) * 100, 100)
     else:
         direction = "stopped"
-    duty_cycle = abs(value) * 100 / 127
+        duty_cycle = 0
     return value, direction, duty_cycle
 
 
@@ -149,8 +155,7 @@ def drive_motor(adc_value):  # Set H-bridge direction pins and PWM duty cycle fr
     else:
         motoRPin1.off()
         motoRPin2.off()
-    b = mapNUM(abs(value), 0, 128, 0, 100)
-    enablePin.value = b / 100.0
+    enablePin.value = min(duty_cycle / 100.0, 1.0)
     return direction, duty_cycle
 
 
