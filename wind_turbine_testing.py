@@ -1,4 +1,59 @@
 #!/usr/bin/env python3
+"""
+IoT Wind Turbine — Test Rig Simulator
+=======================================
+Generates realistic but fake sensor and system data and streams it to Snowflake
+via the Snowpipe Streaming HP SDK. Use this script to populate the same
+Snowflake table as the real Raspberry Pi hardware script (wind_turbine.py)
+without needing any physical hardware.
+
+Simulated data includes:
+    - Motor ADC value, direction, PWM duty cycle, estimated power (sinusoidal)
+    - Photoresistor ADC value and voltage (slow sinusoidal with noise)
+    - Pi system metrics: CPU temp, memory, disk, CPU%, hostname, uptime, etc.
+
+Configuration:
+    Reads Snowflake connection and device settings from a TOML config file.
+    By default it looks for `tgt_snf_account.toml` in the same directory;
+    override with the CONFIG_PATH env var.
+
+    Required TOML sections:
+        [snowflake]            — account, user, role, private_key_file
+        [snowflake.target]     — database, schema, table
+        [device]               — stream_interval
+
+    Key-pair authentication is required. The scripts authenticate as the
+    IOT_STREAMING_USER service user (TYPE=SERVICE, no password). Run setup.sql
+    to create the user, role, and grants. See wind_turbine.py docstring for
+    key generation instructions.
+
+Environment variable overrides:
+    CONFIG_PATH       — path to the TOML config file
+    DEVICE_ID         — identifier for the simulated device (default: "test-turbine-sim")
+    STREAM_INTERVAL   — seconds between readings (float; default from config)
+    NUM_READINGS      — total number of readings to generate (default: 500)
+
+Usage:
+    # Run with defaults (500 readings):
+    python3 wind_turbine_testing.py
+
+    # Custom number of readings and interval:
+    NUM_READINGS=100 STREAM_INTERVAL=0.2 python3 wind_turbine_testing.py
+
+    # Use a different config file:
+    CONFIG_PATH=/path/to/config.toml python3 wind_turbine_testing.py
+
+    # Stop early with Ctrl-C; remaining data is flushed before exit.
+
+Snowflake target:
+    Data lands in IOT_WIND_TURBINE.RAW.SENSOR_READINGS as a single VARIANT
+    column (SENSOR_DATA_JSON). Query the typed view at:
+        SELECT * FROM IOT_WIND_TURBINE.SILVER.SENSOR_READINGS;
+
+Dependencies:
+    pip install snowpipe-streaming
+    (No GPIO or ADC hardware libraries needed — everything is simulated.)
+"""
 import os
 import math
 import time
@@ -14,8 +69,10 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from snowflake.ingest.streaming import StreamingIngestClient
+from snowflake.ingest.streaming import StreamingIngestClient  # Snowpipe Streaming HP SDK
 
+# ── Configuration ────────────────────────────────────────────────────────────
+# Load Snowflake connection details and device settings from TOML config.
 CONFIG_PATH = os.getenv("CONFIG_PATH", str(Path(__file__).parent / "tgt_snf_account.toml"))
 
 with open(CONFIG_PATH, "rb") as f:
@@ -32,13 +89,17 @@ SNOWFLAKE_PRIVATE_KEY_FILE = _sf["private_key_file"]
 SNOWFLAKE_DATABASE = _tgt["database"]
 SNOWFLAKE_SCHEMA = _tgt["schema"]
 SNOWFLAKE_TABLE = _tgt["table"]
-SNOWFLAKE_PIPE = f"{SNOWFLAKE_TABLE}-STREAMING"
+SNOWFLAKE_PIPE = f"{SNOWFLAKE_TABLE}-STREAMING"  # Default pipe auto-created by Snowflake
 
-DEVICE_ID = os.getenv("DEVICE_ID", "test-turbine-sim")
+DEVICE_ID = os.getenv("DEVICE_ID", "test-turbine-sim")  # Distinguishes simulator rows from real Pi data
 CHANNEL_NAME = f"{DEVICE_ID}-channel"
 STREAM_INTERVAL = float(os.getenv("STREAM_INTERVAL", str(_dev["stream_interval"])))
-NUM_READINGS = int(os.getenv("NUM_READINGS", "500"))
+NUM_READINGS = int(os.getenv("NUM_READINGS", "500"))  # Total simulated readings to generate
 
+
+# ── Simulated Sensor Data ─────────────────────────────────────────────────────
+# Generates realistic sinusoidal + noise sensor values that mimic a real
+# wind turbine rig (motor ADC, photoresistor, Pi system metrics).
 
 class SimulatedSensors:
     def __init__(self):
@@ -51,19 +112,19 @@ class SimulatedSensors:
         self.disk_total = 29.7
         self.disk_used = 8.5
 
-    def tick(self):
+    def tick(self):  # Advance simulation clock and recalculate sensor values
         self.time_offset += STREAM_INTERVAL
         self.pot_angle = 128 + 127 * math.sin(self.time_offset * 0.3)
         self.light_level = int(128 + 100 * math.sin(self.time_offset * 0.05 + 1.0))
         self.light_level = max(0, min(255, self.light_level + random.randint(-5, 5)))
 
-    def read_motor_adc(self):
+    def read_motor_adc(self):  # Simulated ADC channel 0 (potentiometer controlling motor)
         return max(0, min(255, int(self.pot_angle + random.gauss(0, 2))))
 
-    def read_photoresistor_adc(self):
+    def read_photoresistor_adc(self):  # Simulated ADC channel 1 (ambient light sensor)
         return self.light_level
 
-    def get_motor_state(self, adc_value):
+    def get_motor_state(self, adc_value):  # Translate ADC midpoint (128) into direction + duty cycle
         value = adc_value - 128
         if value > 0:
             direction = "forward"
@@ -74,7 +135,7 @@ class SimulatedSensors:
         duty_cycle = abs(value) * 100 / 127
         return direction, duty_cycle
 
-    def get_system_metrics(self):
+    def get_system_metrics(self):  # Return simulated Pi system metrics (CPU, memory, disk, uptime)
         cpu_temp = self.base_cpu_temp + 5 * math.sin(self.time_offset * 0.1) + random.gauss(0, 0.5)
         mem_used = self.base_mem_used + 50 * math.sin(self.time_offset * 0.02) + random.gauss(0, 10)
         mem_free = self.mem_total - mem_used
@@ -100,7 +161,9 @@ class SimulatedSensors:
         }
 
 
-def create_streaming_client():
+# ── Snowflake Streaming ──────────────────────────────────────────────────────
+
+def create_streaming_client():  # Open Snowpipe Streaming channel using key-pair auth
     client = StreamingIngestClient(
         client_name=f"{DEVICE_ID}-client",
         db_name=SNOWFLAKE_DATABASE,
@@ -119,7 +182,7 @@ def create_streaming_client():
     return client, channel
 
 
-def build_row(device_id, motor_adc, direction, duty_cycle, light_adc, light_voltage, system_metrics):
+def build_row(device_id, motor_adc, direction, duty_cycle, light_adc, light_voltage, system_metrics):  # Assemble JSON payload for one sensor reading
     payload = {
         "reading_id": str(uuid.uuid4()),
         "device_id": device_id,
@@ -139,13 +202,18 @@ def build_row(device_id, motor_adc, direction, duty_cycle, light_adc, light_volt
         },
         "system_data": system_metrics,
     }
-    return {"sensor_data_json": payload}
+    return {"sensor_data_json": payload}  # Single-key dict maps to VARIANT column via MATCH_BY_COLUMN_NAME
 
 
-def run_simulation(channel):
+# ── Simulation Loop ──────────────────────────────────────────────────────────
+
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+
+def run_simulation(channel):  # Generate NUM_READINGS fake readings and stream in batches to Snowflake
     sim = SimulatedSensors()
-    print(f"\nStreaming {NUM_READINGS} simulated readings to Snowflake...\n")
+    print(f"\nStreaming {NUM_READINGS} simulated readings to Snowflake (batch size {BATCH_SIZE})...\n")
 
+    batch = []
     for seq in range(NUM_READINGS):
         sim.tick()
         motor_adc = sim.read_motor_adc()
@@ -155,12 +223,15 @@ def run_simulation(channel):
         system_metrics = sim.get_system_metrics()
 
         row = build_row(DEVICE_ID, motor_adc, direction, duty_cycle, light_adc, light_voltage, system_metrics)
-        channel.append_row(row, offset_token=str(seq))
+        batch.append(row)
 
-        if seq % 10 == 0 or seq == NUM_READINGS - 1:
-            print(f"  [{seq + 1}/{NUM_READINGS}] Motor: {motor_adc} ({direction}, {duty_cycle:.0f}%) | "
+        if len(batch) >= BATCH_SIZE or seq == NUM_READINGS - 1:
+            channel.append_rows(batch)
+            print(f"  [{seq + 1}/{NUM_READINGS}] Sent batch of {len(batch)} | "
+                  f"Motor: {motor_adc} ({direction}, {duty_cycle:.0f}%) | "
                   f"Light: {light_adc} ({light_voltage:.2f}V) | "
                   f"CPU: {system_metrics['cpu_temperature_celsius']}°C")
+            batch = []
 
         time.sleep(STREAM_INTERVAL)
 

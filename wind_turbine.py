@@ -1,4 +1,61 @@
 #!/usr/bin/env python3
+"""
+IoT Wind Turbine — Raspberry Pi Hardware Script
+=================================================
+Runs on a Raspberry Pi connected to a physical wind turbine rig. Reads sensor
+data from an ADC (motor potentiometer on channel 0, photoresistor on channel 1),
+drives a DC motor via an L293D H-bridge, collects Pi system metrics (CPU temp,
+memory, disk, uptime, etc.), and streams every reading to Snowflake in real time
+using the Snowpipe Streaming high-performance SDK.
+
+Hardware requirements:
+    - Raspberry Pi (tested on Pi 4 Model B)
+    - ADC chip: PCF8591 (I2C addr 0x48) or ADS7830 (I2C addr 0x4b)
+    - L293D motor driver on GPIO pins 17, 22, 27
+    - Potentiometer on ADC channel 0 (motor speed/direction)
+    - Photoresistor on ADC channel 1 (ambient light / solar proxy)
+
+Configuration:
+    All Snowflake connection details and device settings are read from a TOML
+    config file. By default the script looks for `tgt_snf_account.toml` in the
+    same directory, but you can override with the CONFIG_PATH env var.
+
+    Required TOML sections:
+        [snowflake]            — account, user, role, private_key_file
+        [snowflake.target]     — database, schema, table
+        [device]               — device_id, stream_interval
+
+    Key-pair authentication is required. The scripts authenticate as the
+    IOT_STREAMING_USER service user (TYPE=SERVICE, no password). Run setup.sql
+    to create the user, role, and grants. Generate an RSA key pair:
+        openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
+        openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
+    Then set the public key on the user (setup.sql has the placeholder).
+
+Environment variable overrides:
+    CONFIG_PATH       — path to the TOML config file
+    DEVICE_ID         — override device identifier
+    STREAM_INTERVAL   — seconds between readings (float)
+
+Usage:
+    # Run directly on the Pi:
+    python3 wind_turbine.py
+
+    # Override config path and interval:
+    CONFIG_PATH=/path/to/config.toml STREAM_INTERVAL=0.5 python3 wind_turbine.py
+
+    # Stop gracefully with Ctrl-C; remaining data is flushed before exit.
+
+Snowflake target:
+    Data lands in IOT_WIND_TURBINE.RAW.SENSOR_READINGS as a single VARIANT
+    column (SENSOR_DATA_JSON) using the default streaming pipe with
+    MATCH_BY_COLUMN_NAME. Query the typed view at:
+        SELECT * FROM IOT_WIND_TURBINE.SILVER.SENSOR_READINGS;
+
+Dependencies:
+    pip install snowpipe-streaming gpiozero
+    (ADCDevice.py must be in the same directory or on PYTHONPATH)
+"""
 import os
 import sys
 import time
@@ -12,10 +69,12 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from gpiozero import DigitalOutputDevice, PWMOutputDevice
-from ADCDevice import *
-from snowflake.ingest.streaming import StreamingIngestClient
+from gpiozero import DigitalOutputDevice, PWMOutputDevice  # Pi GPIO motor control
+from ADCDevice import *  # I2C ADC helper (PCF8591 / ADS7830)
+from snowflake.ingest.streaming import StreamingIngestClient  # Snowpipe Streaming HP SDK
 
+# ── Configuration ────────────────────────────────────────────────────────────
+# Load Snowflake connection details and device settings from TOML config.
 CONFIG_PATH = os.getenv("CONFIG_PATH", str(Path(__file__).parent / "tgt_snf_account.toml"))
 
 with open(CONFIG_PATH, "rb") as f:
@@ -32,17 +91,22 @@ SNOWFLAKE_PRIVATE_KEY_FILE = _sf["private_key_file"]
 SNOWFLAKE_DATABASE = _tgt["database"]
 SNOWFLAKE_SCHEMA = _tgt["schema"]
 SNOWFLAKE_TABLE = _tgt["table"]
-SNOWFLAKE_PIPE = f"{SNOWFLAKE_TABLE}-STREAMING"
+SNOWFLAKE_PIPE = f"{SNOWFLAKE_TABLE}-STREAMING"  # Default pipe auto-created by Snowflake
 
 DEVICE_ID = os.getenv("DEVICE_ID", _dev["device_id"])
 CHANNEL_NAME = f"{DEVICE_ID}-channel"
 STREAM_INTERVAL = float(os.getenv("STREAM_INTERVAL", str(_dev["stream_interval"])))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
-motoRPin1 = DigitalOutputDevice(27)
-motoRPin2 = DigitalOutputDevice(17)
-enablePin = PWMOutputDevice(22, frequency=1000)
-adc = ADCDevice()
+# ── GPIO & ADC Hardware Setup ────────────────────────────────────────────────
+# L293D H-bridge motor driver pins
+motoRPin1 = DigitalOutputDevice(27)   # direction pin A
+motoRPin2 = DigitalOutputDevice(17)   # direction pin B
+enablePin = PWMOutputDevice(22, frequency=1000)  # PWM speed control
+adc = ADCDevice()  # auto-detected I2C ADC (PCF8591 or ADS7830)
 
+
+# ── Sensor Functions ─────────────────────────────────────────────────────────
 
 def setup_adc():
     global adc
@@ -57,11 +121,11 @@ def setup_adc():
         exit(-1)
 
 
-def mapNUM(value, fromLow, fromHigh, toLow, toHigh):
+def mapNUM(value, fromLow, fromHigh, toLow, toHigh):  # Arduino-style range mapping
     return (toHigh - toLow) * (value - fromLow) / (fromHigh - fromLow) + toLow
 
 
-def get_motor_state(adc_value):
+def get_motor_state(adc_value):  # Translate ADC midpoint (128) into direction + duty cycle
     value = adc_value - 128
     if value > 0:
         direction = "forward"
@@ -73,7 +137,7 @@ def get_motor_state(adc_value):
     return value, direction, duty_cycle
 
 
-def drive_motor(adc_value):
+def drive_motor(adc_value):  # Set H-bridge direction pins and PWM duty cycle from ADC reading
     value, direction, duty_cycle = get_motor_state(adc_value)
     if value > 0:
         motoRPin1.on()
@@ -89,13 +153,13 @@ def drive_motor(adc_value):
     return direction, duty_cycle
 
 
-def get_photoresistor_reading():
+def get_photoresistor_reading():  # Read ambient light level from photoresistor on ADC ch1
     light_value = adc.analogRead(1)
     voltage = light_value / 255.0 * 3.3
     return light_value, voltage
 
 
-def get_pi_system_metrics():
+def get_pi_system_metrics():  # Collect CPU temp, memory, disk, CPU%, serial, hostname, IP, uptime from /proc & /sys
     metrics = {}
 
     try:
@@ -193,7 +257,9 @@ def get_pi_system_metrics():
     return metrics
 
 
-def create_streaming_client():
+# ── Snowflake Streaming ──────────────────────────────────────────────────────
+
+def create_streaming_client():  # Open Snowpipe Streaming channel using key-pair auth
     client = StreamingIngestClient(
         client_name=f"{DEVICE_ID}-client",
         db_name=SNOWFLAKE_DATABASE,
@@ -212,7 +278,7 @@ def create_streaming_client():
     return client, channel
 
 
-def build_row(motor_adc, direction, duty_cycle, light_adc, light_voltage, pi_metrics):
+def build_row(motor_adc, direction, duty_cycle, light_adc, light_voltage, pi_metrics):  # Assemble JSON payload for one sensor reading
     payload = {
         "reading_id": str(uuid.uuid4()),
         "device_id": DEVICE_ID,
@@ -232,11 +298,14 @@ def build_row(motor_adc, direction, duty_cycle, light_adc, light_voltage, pi_met
         },
         "system_data": pi_metrics,
     }
-    return {"sensor_data_json": payload}
+    return {"sensor_data_json": payload}  # Single-key dict maps to VARIANT column via MATCH_BY_COLUMN_NAME
 
 
-def loop(channel):
+# ── Main Loop ────────────────────────────────────────────────────────────────
+
+def loop(channel):  # Infinite read-drive-stream loop; Ctrl-C to stop
     seq = 0
+    batch = []
     while True:
         motor_adc = adc.analogRead(0)
         direction, duty_cycle = drive_motor(motor_adc)
@@ -246,17 +315,22 @@ def loop(channel):
         pi_metrics = get_pi_system_metrics()
 
         row = build_row(motor_adc, direction, duty_cycle, light_adc, light_voltage, pi_metrics)
-        channel.append_row(row, offset_token=str(seq))
+        batch.append(row)
         seq += 1
 
-        print(f"[{seq}] Motor: {motor_adc} ({direction}, {duty_cycle:.0f}%) | "
-              f"Light: {light_adc} ({light_voltage:.2f}V) | "
-              f"CPU: {pi_metrics.get('cpu_temperature_celsius', '?')}°C | "
-              f"Mem: {pi_metrics.get('memory_percent_used', '?')}%")
+        if len(batch) >= BATCH_SIZE:
+            channel.append_rows(batch)
+            print(f"[{seq}] Sent batch of {len(batch)} | "
+                  f"Motor: {motor_adc} ({direction}, {duty_cycle:.0f}%) | "
+                  f"Light: {light_adc} ({light_voltage:.2f}V) | "
+                  f"CPU: {pi_metrics.get('cpu_temperature_celsius', '?')}°C | "
+                  f"Mem: {pi_metrics.get('memory_percent_used', '?')}%")
+            batch = []
+
         time.sleep(STREAM_INTERVAL)
 
 
-def destroy(client, channel):
+def destroy(client, channel):  # Graceful shutdown: release GPIO, flush & close Snowflake channel
     motoRPin1.close()
     motoRPin2.close()
     enablePin.close()
