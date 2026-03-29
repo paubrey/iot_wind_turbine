@@ -102,7 +102,8 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 # L293D H-bridge motor driver pins
 motoRPin1 = DigitalOutputDevice(27)   # direction pin A
 motoRPin2 = DigitalOutputDevice(17)   # direction pin B
-enablePin = PWMOutputDevice(22, frequency=1000)  # PWM speed control
+# enablePin = PWMOutputDevice(22, frequency=1000)  # PWM speed control
+enablePin = PWMOutputDevice(12, frequency=1000)  # PWM speed control
 adc = ADCDevice()  # auto-detected I2C ADC (PCF8591 or ADS7830)
 
 
