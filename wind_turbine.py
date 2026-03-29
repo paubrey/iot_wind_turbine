@@ -56,6 +56,7 @@ Dependencies:
     pip install snowpipe-streaming gpiozero
     (ADCDevice.py must be in the same directory or on PYTHONPATH)
 """
+import math
 import os
 import sys
 import time
@@ -126,21 +127,29 @@ def mapNUM(value, fromLow, fromHigh, toLow, toHigh):  # Arduino-style range mapp
     return (toHigh - toLow) * (value - fromLow) / (fromHigh - fromLow) + toLow
 
 
-ADC_MIDPOINT = 128
+ADC_MIDPOINT_LOW = 118
+ADC_MIDPOINT_HIGH = 138
 ADC_MAX = 255
 ADC_MIN = 0
 
-def get_motor_state(adc_value):  # Translate ADC midpoint into direction + duty cycle scaled to actual pot range
-    value = adc_value - ADC_MIDPOINT
-    if value > 0:
+def _step_duty_cycle(raw_pct):
+    return min(math.ceil(raw_pct / 10) * 10, 100)
+
+def get_motor_state(adc_value):  # Translate ADC dead zone (118-138) into direction + stepped 10% duty cycle
+    if adc_value > ADC_MIDPOINT_HIGH:
         direction = "forward"
-        duty_cycle = min(abs(value) / (ADC_MAX - ADC_MIDPOINT) * 100, 100)
-    elif value < 0:
+        raw_pct = (adc_value - ADC_MIDPOINT_HIGH) / (ADC_MAX - ADC_MIDPOINT_HIGH) * 100
+        duty_cycle = _step_duty_cycle(raw_pct)
+        value = adc_value - ADC_MIDPOINT_HIGH
+    elif adc_value < ADC_MIDPOINT_LOW:
         direction = "backward"
-        duty_cycle = min(abs(value) / (ADC_MIDPOINT - ADC_MIN) * 100, 100)
+        raw_pct = (ADC_MIDPOINT_LOW - adc_value) / (ADC_MIDPOINT_LOW - ADC_MIN) * 100
+        duty_cycle = _step_duty_cycle(raw_pct)
+        value = adc_value - ADC_MIDPOINT_LOW
     else:
         direction = "stopped"
         duty_cycle = 0
+        value = 0
     return value, direction, duty_cycle
 
 
