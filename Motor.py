@@ -37,10 +37,12 @@ def motor(ADC):
         motoRPin1.on()        # motoRPin1 output HIHG level
         motoRPin2.off()       # motoRPin2 output LOW level
         print ('Turn Forward...')
+        print ('Because the ADC value is positive...' + str(value))
     elif (value < 0): # make motor turn backward
         motoRPin1.off() 
         motoRPin2.on()
         print ('Turn Backward...')
+        print ('Because the ADC value is negative...' + str(value))
     else :
         motoRPin1.off()
         motoRPin2.off()
