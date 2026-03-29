@@ -108,6 +108,19 @@ enablePin = PWMOutputDevice(22, frequency=1000)  # PWM speed control
 adc = ADCDevice()  # auto-detected I2C ADC (PCF8591 or ADS7830)
 
 
+I2C_RETRIES = 3
+I2C_RETRY_DELAY = 0.05
+
+def adc_read_with_retry(channel):
+    for attempt in range(I2C_RETRIES):
+        try:
+            return adc.analogRead(channel)
+        except OSError:
+            if attempt < I2C_RETRIES - 1:
+                time.sleep(I2C_RETRY_DELAY)
+    return None
+
+
 # ── Sensor Functions ─────────────────────────────────────────────────────────
 
 def setup_adc():
@@ -169,7 +182,9 @@ def drive_motor(adc_value):  # Set H-bridge direction pins and PWM duty cycle fr
 
 
 def get_photoresistor_reading():  # Read ambient light level from photoresistor on ADC ch1
-    light_value = adc.analogRead(1)
+    light_value = adc_read_with_retry(1)
+    if light_value is None:
+        return 0, 0.0
     voltage = light_value / 255.0 * 3.3
     return light_value, voltage
 
@@ -322,10 +337,17 @@ def loop(channel):  # Infinite read-drive-stream loop; Ctrl-C to stop
     seq = 0
     batch = []
     while True:
-        motor_adc = adc.analogRead(0)
+        motor_adc = adc_read_with_retry(0)
+        if motor_adc is None:
+            time.sleep(STREAM_INTERVAL)
+            continue
         direction, duty_cycle = drive_motor(motor_adc)
 
-        light_adc, light_voltage = get_photoresistor_reading()
+        light_adc = adc_read_with_retry(1)
+        if light_adc is None:
+            time.sleep(STREAM_INTERVAL)
+            continue
+        light_voltage = light_adc / 255.0 * 3.3
 
         pi_metrics = get_pi_system_metrics()
 
